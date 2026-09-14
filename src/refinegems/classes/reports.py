@@ -2219,39 +2219,52 @@ class ModelComparisonReport(Report):
     def __init__(self, models: list[cobra.Model], rename: list[str] = None):
         super().__init__()
         self.models = models
+        
+        if len(self.models) < 2:
+            raise ValueError("At least two models are required for comparison.")
+            
         self.model_names = rename if rename else [m.id for m in models]
         
         if len(self.models) != len(self.model_names):
             raise ValueError("Length of rename list must match number of models.")
             
+        if len(set(self.model_names)) != len(self.model_names):
+            raise ValueError("Model names must be unique.")
+            
         self.overlap_data = {"reactions": {}, "metabolites": {}, "genes": {}}
         self._calculate_overlap()
 
     def _get_flattened_annotations(self, entity) -> set:
-        """Flattens a COBRApy annotation dictionary into a set of 'db:id' strings."""
+        """Flattens a COBRApy annotation dictionary into a set of namespace-independent IDs."""
         annots = set()
         for db, ids in entity.annotation.items():
+            # Skip broad terms that do not indicate entity identity
+            if 'sbo' in db.lower():
+                continue
+                
             if isinstance(ids, list):
                 for i in ids:
-                    annots.add(f"{db}:{i}")
+                    annots.add(str(i)) # Store only the ID, ignoring the namespace prefix
             elif isinstance(ids, str):
-                annots.add(f"{db}:{ids}")
-        # Always include the internal ID as a fallback for unannotated entities
-        annots.add(f"internal:{entity.id}")
+                annots.add(str(ids))
+                
+        # Only fallback to the internal ID if absolutely no identity annotations exist
+        if not annots:
+            annots.add(f"internal:{entity.id}")
+            
         return annots
 
     def _calculate_overlap(self):
         """Calculates entity overlaps across models using disjoint-set (connected components) logic."""
+        from collections import deque
         
         for entity_type in ["reactions", "metabolites", "genes"]:
-            # List of all entities across all models. Each entry: (model_name, entity_object)
             all_entities = []
             for model, name in zip(self.models, self.model_names):
                 entities = getattr(model, entity_type)
                 for e in entities:
                     all_entities.append((name, e))
             
-            # Map each annotation to the list of entity indices that possess it
             annotation_to_indices = {}
             for i, (model_name, entity) in enumerate(all_entities):
                 annots = self._get_flattened_annotations(entity)
@@ -2260,30 +2273,28 @@ class ModelComparisonReport(Report):
                         annotation_to_indices[ann] = []
                     annotation_to_indices[ann].append(i)
             
-            # Find connected components (entities sharing at least one annotation)
             visited = set()
             components = []
             
             for i in range(len(all_entities)):
                 if i not in visited:
-                    # BFS to find all connected entities
                     component = set()
-                    queue = [i]
+                    queue = deque([i]) # Use deque for O(1) pops
+                    
                     while queue:
-                        curr = queue.pop(0)
+                        curr = queue.popleft()
                         if curr not in visited:
                             visited.add(curr)
                             component.add(curr)
-                            # Find neighbors through shared annotations
+                            
                             curr_entity = all_entities[curr][1]
                             for ann in self._get_flattened_annotations(curr_entity):
-                                for neighbor in annotation_to_indices[ann]:
+                                for neighbor in annotation_to_indices.get(ann, []):
                                     if neighbor not in visited:
                                         queue.append(neighbor)
+                                        
                     components.append(component)
                     
-            # Map components to model memberships for UpSet/Venn plotting
-            # For each unique entity (component), which models contain it?
             memberships = []
             for comp in components:
                 models_in_comp = set([all_entities[idx][0] for idx in comp])
