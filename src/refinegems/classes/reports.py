@@ -2223,7 +2223,8 @@ class ModelComparisonReport(Report):
         if len(self.models) < 2:
             raise ValueError("At least two models are required for comparison.")
             
-        self.model_names = rename if rename else [m.id for m in models]
+        # Fix: explicitly check against None to prevent empty list bypass
+        self.model_names = rename if rename is not None else [m.id for m in models]
         
         if len(self.models) != len(self.model_names):
             raise ValueError("Length of rename list must match number of models.")
@@ -2238,127 +2239,73 @@ class ModelComparisonReport(Report):
         """Flattens a COBRApy annotation dictionary into a set of namespace-independent IDs."""
         annots = set()
         for db, ids in entity.annotation.items():
-            # Skip broad terms that do not indicate entity identity
             if 'sbo' in db.lower():
                 continue
-                
             if isinstance(ids, list):
                 for i in ids:
-                    annots.add(str(i)) # Store only the ID, ignoring the namespace prefix
+                    annots.add(str(i))
             elif isinstance(ids, str):
                 annots.add(str(ids))
-                
-        # Only fallback to the internal ID if absolutely no identity annotations exist
-        if not annots:
-            annots.add(f"internal:{entity.id}")
-            
+        # Fix: Do NOT fallback to internal ID here to prevent false positives like R_ATPM
         return annots
 
     def _calculate_overlap(self):
-        """Calculates entity overlaps across models using disjoint-set (connected components) logic."""
-        from collections import deque
-        
+        """Calculates direct annotation overlap, preventing transitive closures and bottlenecks."""
         for entity_type in ["reactions", "metabolites", "genes"]:
-            all_entities = []
-            for model, name in zip(self.models, self.model_names):
+            annotation_memberships = {}
+            unannotated_memberships = []
+
+            for model_name, model in zip(self.model_names, self.models):
                 entities = getattr(model, entity_type)
                 for e in entities:
-                    all_entities.append((name, e))
+                    annots = self._get_flattened_annotations(e)
+                    if not annots:
+                        # Fix: Keep missing-identity entities completely separate per model
+                        unannotated_memberships.append([model_name])
+                    else:
+                        for ann in annots:
+                            if ann not in annotation_memberships:
+                                annotation_memberships[ann] = set()
+                            annotation_memberships[ann].add(model_name)
             
-            annotation_to_indices = {}
-            for i, (model_name, entity) in enumerate(all_entities):
-                annots = self._get_flattened_annotations(entity)
-                for ann in annots:
-                    if ann not in annotation_to_indices:
-                        annotation_to_indices[ann] = []
-                    annotation_to_indices[ann].append(i)
-            
-            visited = set()
-            components = []
-            
-            for i in range(len(all_entities)):
-                if i not in visited:
-                    component = set()
-                    queue = deque([i]) # Use deque for O(1) pops
-                    
-                    while queue:
-                        curr = queue.popleft()
-                        if curr not in visited:
-                            visited.add(curr)
-                            component.add(curr)
-                            
-                            curr_entity = all_entities[curr][1]
-                            for ann in self._get_flattened_annotations(curr_entity):
-                                for neighbor in annotation_to_indices.get(ann, []):
-                                    if neighbor not in visited:
-                                        queue.append(neighbor)
-                                        
-                    components.append(component)
-                    
-            memberships = []
-            for comp in components:
-                models_in_comp = set([all_entities[idx][0] for idx in comp])
-                memberships.append(list(models_in_comp))
-                
+            # Fix: Sort lists to guarantee deterministic serialization order
+            memberships = [sorted(list(models)) for models in annotation_memberships.values()]
+            memberships.extend(unannotated_memberships)
             self.overlap_data[entity_type] = memberships
 
     def visualise(self, entity_type: Literal["reactions", "metabolites", "genes"] = "reactions", 
-                  cmap: Union[list[tuple], None] = None, upset_min_subset_size: int = 15, **kwargs) -> matplotlib.figure.Figure:
-        """Visualise the model comparison.
-        
-        Dynamically routes to a Venn diagram (<= 4 models) or an UpSet plot (> 4 models).
-        
-        Args:
-            entity_type: The type of entity to visualize. Defaults to "reactions".
-            cmap: Optional color map.
-            upset_min_subset_size: Minimum subset size for UpSet plot.
-            **kwargs: Additional plotting arguments.
+                  cmap: Union[list[tuple], None] = None, upset_min_subset_size: int = 15, **kwargs) -> Union[matplotlib.figure.Figure, None]:
+        memberships = self.overlap_data.get(entity_type, [])
+        if not memberships:
+            return None
             
-        Returns:
-            matplotlib.figure.Figure: The generated plot.
-        """
-        memberships = self.overlap_data[entity_type]
-        
         if len(self.models) <= 4:
             return self._plot_venn(memberships, entity_type, cmap, **kwargs)
         else:
             return self._plot_upset(memberships, entity_type, cmap, upset_min_subset_size, **kwargs)
 
     def _plot_venn(self, memberships: list, entity_type: str, cmap, **kwargs):
-        """Helper to generate a Venn diagram (<= 4 models)."""
-        # Convert memberships to the dictionary format expected by the venn library
         model2ids = {name: set() for name in self.model_names}
         for i, models_present in enumerate(memberships):
             for model_name in models_present:
                 model2ids[model_name].add(f"entity_{i}")
                 
         venn_kwargs = kwargs.get('venn_kwargs', {'fmt': "{percentage:.1f}%", 'legend_loc': 'lower right'})
-        
-        # venn() returns an Axes object, not a Figure
         ax = venn(model2ids, cmap=cmap, **venn_kwargs)
         ax.set_title(f"Annotation Overlap: {entity_type.capitalize()}")
-        
-        # Extract and return the parent figure to keep return types consistent
         return ax.get_figure()
 
     def _plot_upset(self, memberships: list, entity_type: str, cmap, min_subset_size: int, **kwargs):
-        """Helper to generate an UpSet plot (> 4 models)."""
         from collections import Counter
-        
-        # Pre-aggregate memberships to avoid upsetplot/pandas duplicate index bugs
         membership_tuples = [tuple(sorted(m)) for m in memberships]
         counts = Counter(membership_tuples)
         
-        unique_memberships = list(counts.keys())
-        data_counts = list(counts.values())
-        
-        upset_data = from_memberships(unique_memberships, data=data_counts)
+        upset_data = from_memberships(list(counts.keys()), data=list(counts.values()))
         fig = plt.figure()
-        
-        # Set show_counts=False to bypass the pandas >= 2.2.0 matplotlib plotting bug
         upset = UpSet(upset_data, subset_size='sum', min_subset_size=min_subset_size, show_counts=False)
         
-        if cmap:
+        # Fix: Guard the colorization path to prevent max() crashes on empty datasets
+        if cmap and not upset_data.empty:
             max_degree = max(len(idx) for idx in upset_data.index)
             for degree in range(1, max_degree + 1):
                 colour = cmap[(degree - 1) % len(cmap)]
@@ -2366,27 +2313,41 @@ class ModelComparisonReport(Report):
 
         plot_res = upset.plot(fig=fig)
         plot_res["intersections"].set_ylabel("Subset size")
-        plot_res["totals"].set_xlabel("Total Entity amount")
+        plot_res["totals"].set_xlabel("Total Amount")
         fig.suptitle(f"Annotation Overlap: {entity_type.capitalize()}", fontsize=14)
         return fig
 
     def to_table(self) -> pd.DataFrame:
         """Return a summary table of the overlap statistics."""
-        # @TODO: Format self.overlap_data into a pandas DataFrame based on exact requirements
-        pass
+        import pandas as pd
+        from collections import Counter
+        
+        rows = []
+        for entity_type, memberships in self.overlap_data.items():
+            counts = Counter([tuple(m) for m in memberships])
+            for models, count in counts.items():
+                rows.append({
+                    "Entity": entity_type,
+                    "Models_Shared": " & ".join(models),
+                    "Count": count
+                })
+        return pd.DataFrame(rows)
 
     def save(self, dir: Union[str, Path], **kwargs):
         """Save the comparison report tables and plots to the specified directory."""
         super().save(dir)
-        
         dir_path = Path(dir) / "ModelComparisonReport"
         dir_path.mkdir(parents=True, exist_ok=True)
         
+        df = self.to_table()
+        df.to_csv(dir_path / "overlap_statistics.csv", index=False, sep=";")
+        
         for entity_type in ["reactions", "metabolites", "genes"]:
             fig = self.visualise(entity_type=entity_type, **kwargs)
-            fig.savefig(dir_path / f"{entity_type}_overlap.png", bbox_inches="tight", dpi=300)
-            plt.close(fig)
-            
+            if fig:
+                fig.savefig(dir_path / f"{entity_type}_overlap.png", bbox_inches="tight", dpi=300)
+                plt.close(fig)
+                
     def __str__(self):
         return f"ModelComparisonReport comparing {len(self.models)} models: {', '.join(self.model_names)}."
         
