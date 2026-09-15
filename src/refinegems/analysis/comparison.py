@@ -183,27 +183,11 @@ def get_entity_curie_set_per_db(model: libModel, entity: Literal['genes', 'metab
 def plot_venn(
     models: list[cobraModel], entity: str, perc: bool = False, rename=None
 ) -> matplotlib.axes.Axes:
-    """Creates Venn diagram to show the overlap of model entities
+    """Creates Venn diagram to show the overlap of model entities.
 
     .. deprecated:: 2.1
        This function is deprecated and will be removed in a future release. 
        Please use classes.reports.ModelComparisonReport instead.
-
-    Args:
-        - models (list[cobraModel]):
-            Models loaded with cobrapy
-        - entity (str):
-            Compare on metabolite|reaction
-        - perc (bool, optional):
-            True if percentages should be used.
-            Defaults to False.
-        - rename (dict, optional):
-            Rename model ids to custom names.
-            Defaults to None.
-
-    Returns:
-        matplotlib.axes.Axes:
-            Venn diagram
     """
     import warnings
     warnings.warn(
@@ -211,25 +195,25 @@ def plot_venn(
         DeprecationWarning,
         stacklevel=2
     )
-
-    intersec = {} # model ID : list of entity IDs
-    for model in models:
-        reas = [] # List of current entity IDs
-        if entity == "metabolite":
-            for rea in model.metabolites:
-                reas.append(rea.id)
-        if entity == "reaction":
-            for rea in model.reactions:
-                reas.append(rea.id)
-        if rename is not None:
-            intersec[rename[model.id]] = set(reas)
-        else:
-            intersec[model.id] = set(reas)
-    if perc:
-        fig = venn(intersec, fmt="{percentage:.1f}%")
+    
+    from ..classes.reports import ModelComparisonReport
+    
+    # Safely convert the legacy dictionary mapping to the new list format
+    if isinstance(rename, dict):
+        rename_list = [rename.get(m.id, m.id) for m in models]
     else:
-        fig = venn(intersec)
-    return fig
+        rename_list = rename
+        
+    entity_map = {"metabolite": "metabolites", "reaction": "reactions"}
+    mapped_entity = entity_map.get(entity, entity)
+    
+    # Use match_by="id" to perfectly preserve legacy semantics
+    report = ModelComparisonReport(models, rename=rename_list, match_by="id")
+    
+    venn_kwargs = {'fmt': "{percentage:.1f}%"} if perc else {}
+    fig = report.visualise(entity_type=mapped_entity, venn_kwargs=venn_kwargs)
+    
+    return fig.axes[0] if fig and fig.axes else None
 
 
 def plot_db_entity_overlap(

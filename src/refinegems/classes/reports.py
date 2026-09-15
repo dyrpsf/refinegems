@@ -2203,27 +2203,20 @@ class MultiSBOTermReport(Report):
 
 
 class ModelComparisonReport(Report):
-    """Report for comparing multiple models based on overall annotation overlap.
+    """Report for comparing multiple models based on annotation or ID overlap.
     
     Dynamically generates Venn diagrams (for <= 4 models) or UpSet plots (for > 4 models)
-    to visualize the intersection of metabolites, reactions, and genes. Entities are matched
-    across models if they share ANY common annotation, ignoring specific namespaces.
-    
-    Attributes:
-        models (list[cobra.Model]): List of models to compare.
-        model_names (list[str]): Names of the models for plotting labels.
-        overlap_data (dict): Dictionary storing the calculated overlap memberships for 
-                             reactions, metabolites, and genes.
+    to visualize the intersection of metabolites, reactions, and genes.
     """
 
-    def __init__(self, models: list[cobra.Model], rename: list[str] = None):
+    def __init__(self, models: list[cobra.Model], rename: list[str] = None, match_by: str = "annotation"):
         super().__init__()
         self.models = models
+        self.match_by = match_by
         
         if len(self.models) < 2:
             raise ValueError("At least two models are required for comparison.")
             
-        # Fix: explicitly check against None to prevent empty list bypass
         self.model_names = rename if rename is not None else [m.id for m in models]
         
         if len(self.models) != len(self.model_names):
@@ -2235,8 +2228,11 @@ class ModelComparisonReport(Report):
         self.overlap_data = {"reactions": {}, "metabolites": {}, "genes": {}}
         self._calculate_overlap()
 
-    def _get_flattened_annotations(self, entity) -> set:
-        """Flattens a COBRApy annotation dictionary into a set of namespace-independent IDs."""
+    def _get_canonical_id(self, entity) -> str:
+        """Assigns a single canonical ID to an entity to prevent double counting and transitive closures."""
+        if self.match_by == "id":
+            return entity.id
+            
         annots = set()
         for db, ids in entity.annotation.items():
             if 'sbo' in db.lower():
@@ -2246,66 +2242,41 @@ class ModelComparisonReport(Report):
                     annots.add(str(i))
             elif isinstance(ids, str):
                 annots.add(str(ids))
-        # Fix: Do NOT fallback to internal ID here to prevent false positives like R_ATPM
-        return annots
+                
+        if not annots:
+            # Return a completely unique string to keep unannotated entities strictly separate
+            return f"unannotated_{id(entity)}"
+            
+        # Lexicographically first annotation serves as the strict canonical identifier
+        return sorted(list(annots))[0]
 
     def _calculate_overlap(self):
-        """Calculates annotation overlap using a Union-Find (Disjoint Set) algorithm 
-        to group entities into components without double counting."""
-        from collections import defaultdict
-
+        """Calculates direct overlap by grouping entities via their canonical ID."""
         for entity_type in ["reactions", "metabolites", "genes"]:
-            parent = {}
-            model_mapping = {}
-            
-            def find(i):
-                if parent[i] == i: 
-                    return i
-                parent[i] = find(parent[i]) # Path compression
-                return parent[i]
-                
-            def union(i, j):
-                root_i = find(i)
-                root_j = find(j)
-                if root_i != root_j:
-                    parent[root_i] = root_j
-
-            node_id = 0
-            annot_to_nodes = {}
+            canonical_to_models = {}
             unannotated_memberships = []
 
             for model_name, model in zip(self.model_names, self.models):
                 entities = getattr(model, entity_type)
                 for e in entities:
-                    annots = self._get_flattened_annotations(e)
-                    if not annots:
-                        # Keep unannotated entities strictly separate
+                    canonical_id = self._get_canonical_id(e)
+                    if canonical_id.startswith("unannotated_"):
                         unannotated_memberships.append([model_name])
                     else:
-                        parent[node_id] = node_id
-                        model_mapping[node_id] = model_name
-                        
-                        for ann in annots:
-                            if ann in annot_to_nodes:
-                                # Connect this entity to previously seen entities sharing the annotation
-                                union(node_id, annot_to_nodes[ann])
-                            else:
-                                annot_to_nodes[ann] = node_id
-                        node_id += 1
-
-            # Group all connected entities by their root component
-            components = defaultdict(set)
-            for i in range(node_id):
-                root = find(i)
-                components[root].add(model_mapping[i])
-
-            memberships = [sorted(list(models)) for models in components.values()]
-            memberships.extend(unannotated_memberships)
+                        if canonical_id not in canonical_to_models:
+                            canonical_to_models[canonical_id] = set()
+                        canonical_to_models[canonical_id].add(model_name)
             
+            memberships = [sorted(list(models)) for models in canonical_to_models.values()]
+            memberships.extend(unannotated_memberships)
             self.overlap_data[entity_type] = memberships
 
     def visualise(self, entity_type: Literal["reactions", "metabolites", "genes"] = "reactions", 
                   cmap: Union[list[tuple], None] = None, upset_min_subset_size: int = 15, **kwargs) -> Union[matplotlib.figure.Figure, None]:
+        
+        if entity_type not in ["reactions", "metabolites", "genes"]:
+            raise ValueError(f"Invalid entity_type: {entity_type}. Must be 'reactions', 'metabolites', or 'genes'.")
+            
         memberships = self.overlap_data.get(entity_type, [])
         if not memberships:
             return None
@@ -2331,11 +2302,15 @@ class ModelComparisonReport(Report):
         membership_tuples = [tuple(sorted(m)) for m in memberships]
         counts = Counter(membership_tuples)
         
+        # Inject dummy 0-counts for any missing models to guarantee they appear in the UpSet index
+        for m_name in self.model_names:
+            if (m_name,) not in counts:
+                counts[(m_name,)] = 0
+        
         upset_data = from_memberships(list(counts.keys()), data=list(counts.values()))
         fig = plt.figure()
         upset = UpSet(upset_data, subset_size='sum', min_subset_size=min_subset_size, show_counts=False)
         
-        # Fix: Guard the colorization path to prevent max() crashes on empty datasets
         if cmap and not upset_data.empty:
             max_degree = max(len(idx) for idx in upset_data.index)
             for degree in range(1, max_degree + 1):
