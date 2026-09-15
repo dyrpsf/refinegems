@@ -2250,9 +2250,28 @@ class ModelComparisonReport(Report):
         return annots
 
     def _calculate_overlap(self):
-        """Calculates direct annotation overlap, preventing transitive closures and bottlenecks."""
+        """Calculates annotation overlap using a Union-Find (Disjoint Set) algorithm 
+        to group entities into components without double counting."""
+        from collections import defaultdict
+
         for entity_type in ["reactions", "metabolites", "genes"]:
-            annotation_memberships = {}
+            parent = {}
+            model_mapping = {}
+            
+            def find(i):
+                if parent[i] == i: 
+                    return i
+                parent[i] = find(parent[i]) # Path compression
+                return parent[i]
+                
+            def union(i, j):
+                root_i = find(i)
+                root_j = find(j)
+                if root_i != root_j:
+                    parent[root_i] = root_j
+
+            node_id = 0
+            annot_to_nodes = {}
             unannotated_memberships = []
 
             for model_name, model in zip(self.model_names, self.models):
@@ -2260,17 +2279,29 @@ class ModelComparisonReport(Report):
                 for e in entities:
                     annots = self._get_flattened_annotations(e)
                     if not annots:
-                        # Fix: Keep missing-identity entities completely separate per model
+                        # Keep unannotated entities strictly separate
                         unannotated_memberships.append([model_name])
                     else:
+                        parent[node_id] = node_id
+                        model_mapping[node_id] = model_name
+                        
                         for ann in annots:
-                            if ann not in annotation_memberships:
-                                annotation_memberships[ann] = set()
-                            annotation_memberships[ann].add(model_name)
-            
-            # Fix: Sort lists to guarantee deterministic serialization order
-            memberships = [sorted(list(models)) for models in annotation_memberships.values()]
+                            if ann in annot_to_nodes:
+                                # Connect this entity to previously seen entities sharing the annotation
+                                union(node_id, annot_to_nodes[ann])
+                            else:
+                                annot_to_nodes[ann] = node_id
+                        node_id += 1
+
+            # Group all connected entities by their root component
+            components = defaultdict(set)
+            for i in range(node_id):
+                root = find(i)
+                components[root].add(model_mapping[i])
+
+            memberships = [sorted(list(models)) for models in components.values()]
             memberships.extend(unannotated_memberships)
+            
             self.overlap_data[entity_type] = memberships
 
     def visualise(self, entity_type: Literal["reactions", "metabolites", "genes"] = "reactions", 

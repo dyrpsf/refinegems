@@ -14,6 +14,7 @@ __author__ = "Famke Baeuerle, Gwendolyn O. Döbel and Carolin Brune"
 import logging
 import matplotlib
 import matplotlib.pyplot as plt
+import warnings
 
 from cobra import Model as cobraModel
 from libsbml import Model as libModel
@@ -182,42 +183,34 @@ def get_entity_curie_set_per_db(model: libModel, entity: Literal['genes', 'metab
 def plot_venn(
     models: list[cobraModel], entity: str, perc: bool = False, rename=None
 ) -> matplotlib.axes.Axes:
-    """Creates Venn diagram to show the overlap of model entities
-
-    Args:
-        - models (list[cobraModel]):
-            Models loaded with cobrapy
-        - entity (str):
-            Compare on metabolite|reaction
-        - perc (bool, optional):
-            True if percentages should be used.
-            Defaults to False.
-        - rename (dict, optional):
-            Rename model ids to custom names.
-            Defaults to None.
-
-    Returns:
-        matplotlib.axes.Axes:
-            Venn diagram
+    """Creates Venn diagram to show the overlap of model entities.
+    
+    .. deprecated:: 2.1
+       This function is deprecated and will be removed in a future release. 
+       Please use classes.reports.ModelComparisonReport instead.
     """
-    intersec = {} # model ID : list of entity IDs
-    for model in models:
-        reas = [] # List of current entity IDs
-        if entity == "metabolite":
-            for rea in model.metabolites:
-                reas.append(rea.id)
-        if entity == "reaction":
-            for rea in model.reactions:
-                reas.append(rea.id)
-        if rename is not None:
-            intersec[rename[model.id]] = set(reas)
-        else:
-            intersec[model.id] = set(reas)
+    warnings.warn(
+        "plot_venn is deprecated and will be removed. Use classes.reports.ModelComparisonReport instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
+    from ..classes.reports import ModelComparisonReport
+    
+    # Map old entity strings to the new plural format
+    entity_map = {"metabolite": "metabolites", "reaction": "reactions"}
+    mapped_entity = entity_map.get(entity, entity)
+    
+    report = ModelComparisonReport(models, rename=rename)
+    
+    venn_kwargs = {}
     if perc:
-        fig = venn(intersec, fmt="{percentage:.1f}%")
-    else:
-        fig = venn(intersec)
-    return fig
+        venn_kwargs['fmt'] = "{percentage:.1f}%"
+        
+    fig = report.visualise(entity_type=mapped_entity, venn_kwargs=venn_kwargs)
+    
+    # Return the Axes object to maintain backward compatibility with old callers
+    return fig.axes[0] if fig and fig.axes else None
 
 
 def plot_db_entity_overlap(
