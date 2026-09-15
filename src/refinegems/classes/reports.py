@@ -2212,6 +2212,9 @@ class ModelComparisonReport(Report):
     def __init__(self, models: list[cobra.Model], rename: list[str] = None, match_by: str = "annotation"):
         super().__init__()
         self.models = models
+        
+        if match_by not in {"id", "annotation"}:
+            raise ValueError("match_by must be 'id' or 'annotation'.")
         self.match_by = match_by
         
         if len(self.models) < 2:
@@ -2228,10 +2231,10 @@ class ModelComparisonReport(Report):
         self.overlap_data = {"reactions": {}, "metabolites": {}, "genes": {}}
         self._calculate_overlap()
 
-    def _get_canonical_id(self, entity) -> str:
-        """Assigns a single canonical ID to an entity to prevent double counting and transitive closures."""
+    def _get_flattened_annotations(self, entity) -> list:
+        """Extracts all relevant IDs or annotation strings for matching."""
         if self.match_by == "id":
-            return entity.id
+            return [entity.id]
             
         annots = set()
         for db, ids in entity.annotation.items():
@@ -2242,33 +2245,67 @@ class ModelComparisonReport(Report):
                     annots.add(str(i))
             elif isinstance(ids, str):
                 annots.add(str(ids))
-                
-        if not annots:
-            # Return a completely unique string to keep unannotated entities strictly separate
-            return f"unannotated_{id(entity)}"
-            
-        # Lexicographically first annotation serves as the strict canonical identifier
-        return sorted(list(annots))[0]
+        return list(annots)
 
     def _calculate_overlap(self):
-        """Calculates direct overlap by grouping entities via their canonical ID."""
+        """Calculates direct overlap by grouping entity nodes via Union-Find."""
+        from collections import defaultdict
+        
         for entity_type in ["reactions", "metabolites", "genes"]:
-            canonical_to_models = {}
-            unannotated_memberships = []
-
+            # 1. Collect all entities with a strict index mapping
+            all_entities = []
             for model_name, model in zip(self.model_names, self.models):
-                entities = getattr(model, entity_type)
-                for e in entities:
-                    canonical_id = self._get_canonical_id(e)
-                    if canonical_id.startswith("unannotated_"):
-                        unannotated_memberships.append([model_name])
-                    else:
-                        if canonical_id not in canonical_to_models:
-                            canonical_to_models[canonical_id] = set()
-                        canonical_to_models[canonical_id].add(model_name)
+                for e in getattr(model, entity_type):
+                    all_entities.append((model_name, e))
             
-            memberships = [sorted(list(models)) for models in canonical_to_models.values()]
-            memberships.extend(unannotated_memberships)
+            N = len(all_entities)
+            parent = list(range(N))
+            
+            def find(i):
+                if parent[i] == i: 
+                    return i
+                parent[i] = find(parent[i])
+                return parent[i]
+                
+            def union(i, j):
+                root_i = find(i)
+                root_j = find(j)
+                if root_i != root_j:
+                    parent[root_i] = root_j
+
+            # 2. Map annotations to entity indices
+            annot_to_indices = defaultdict(list)
+            unannotated_indices = []
+            
+            for i, (m_name, e) in enumerate(all_entities):
+                annots = self._get_flattened_annotations(e)
+                if not annots:
+                    unannotated_indices.append(i)
+                else:
+                    for ann in annots:
+                        annot_to_indices[ann].append(i)
+
+            # 3. Union all entities that share at least one annotation
+            for indices in annot_to_indices.values():
+                first_idx = indices[0]
+                for idx in indices[1:]:
+                    union(first_idx, idx)
+
+            # 4. Group models by the connected entity component root
+            components = defaultdict(set)
+            for i in range(N):
+                if i not in unannotated_indices:
+                    root = find(i)
+                    model_name = all_entities[i][0]
+                    components[root].add(model_name)
+
+            # 5. Extract unique model memberships to prevent double counting
+            memberships = [sorted(list(models)) for models in components.values()]
+            
+            # Keep unannotated entities strictly separated
+            for idx in unannotated_indices:
+                memberships.append([all_entities[idx][0]])
+                
             self.overlap_data[entity_type] = memberships
 
     def visualise(self, entity_type: Literal["reactions", "metabolites", "genes"] = "reactions", 
@@ -2294,7 +2331,8 @@ class ModelComparisonReport(Report):
                 
         venn_kwargs = kwargs.get('venn_kwargs', {'fmt': "{percentage:.1f}%", 'legend_loc': 'lower right'})
         ax = venn(model2ids, cmap=cmap, **venn_kwargs)
-        ax.set_title(f"Annotation Overlap: {entity_type.capitalize()}")
+        title_prefix = "ID" if self.match_by == "id" else "Annotation"
+        ax.set_title(f"{title_prefix} Overlap: {entity_type.capitalize()}")
         return ax.get_figure()
 
     def _plot_upset(self, memberships: list, entity_type: str, cmap, min_subset_size: int, **kwargs):
@@ -2302,7 +2340,6 @@ class ModelComparisonReport(Report):
         membership_tuples = [tuple(sorted(m)) for m in memberships]
         counts = Counter(membership_tuples)
         
-        # Inject dummy 0-counts for any missing models to guarantee they appear in the UpSet index
         for m_name in self.model_names:
             if (m_name,) not in counts:
                 counts[(m_name,)] = 0
@@ -2320,7 +2357,9 @@ class ModelComparisonReport(Report):
         plot_res = upset.plot(fig=fig)
         plot_res["intersections"].set_ylabel("Subset size")
         plot_res["totals"].set_xlabel("Total Amount")
-        fig.suptitle(f"Annotation Overlap: {entity_type.capitalize()}", fontsize=14)
+        
+        title_prefix = "ID" if self.match_by == "id" else "Annotation"
+        fig.suptitle(f"{title_prefix} Overlap: {entity_type.capitalize()}", fontsize=14)
         return fig
 
     def to_table(self) -> pd.DataFrame:
