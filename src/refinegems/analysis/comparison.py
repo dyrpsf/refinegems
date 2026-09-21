@@ -187,31 +187,45 @@ def plot_venn(
 
     .. deprecated:: 2.1
        This function is deprecated and will be removed in a future release. 
-       Please use classes.reports.ModelComparisonReport instead.
+       Please use classes.reports.EntityComparisonReport instead.
+
+    Args:
+        - models (list[cobraModel]):
+            Models loaded with cobrapy
+        - entity (str):
+            Compare on metabolite|reaction
+        - perc (bool, optional):
+            True if percentages should be used.
+            Defaults to False.
+        - rename (dict, optional):
+            Rename model ids to custom names.
+            Defaults to None.
+
+    Returns:
+        matplotlib.axes.Axes:
+            Venn diagram. If None is returned, no figure was produced.
     """
     import warnings
     warnings.warn(
-        "plot_venn is deprecated and will be removed. Use classes.reports.ModelComparisonReport instead.",
+        "plot_venn is deprecated and will be removed. Use classes.reports.EntityComparisonReport instead.",
         DeprecationWarning,
         stacklevel=2
     )
     
-    from ..classes.reports import ModelComparisonReport
+    from ..classes.reports import EntityComparisonReport
     
-    # Safely convert the legacy dictionary mapping to the new list format
     if isinstance(rename, dict):
-        rename_list = [rename.get(m.id, m.id) for m in models]
+        rename_list = [rename.get(m.id, getattr(m, 'id', f"model_{i}")) for i, m in enumerate(models)]
     else:
         rename_list = rename
         
     entity_map = {"metabolite": "metabolites", "reaction": "reactions"}
     mapped_entity = entity_map.get(entity, entity)
     
-    # Use match_by="id" to perfectly preserve legacy semantics
-    report = ModelComparisonReport(models, rename=rename_list, match_by="id")
+    report = EntityComparisonReport(models, entity_type=mapped_entity, rename=rename_list, match_by="id")
     
     venn_kwargs = {'fmt': "{percentage:.1f}%"} if perc else {}
-    fig = report.visualise(entity_type=mapped_entity, venn_kwargs=venn_kwargs)
+    fig = report.visualise(venn_kwargs=venn_kwargs)
     
     return fig.axes[0] if fig and fig.axes else None
 

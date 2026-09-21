@@ -2202,25 +2202,27 @@ class MultiSBOTermReport(Report):
         fig.savefig(Path(dir, "sboterms.png"), bbox_inches='tight', dpi=400)
 
 
-class ModelComparisonReport(Report):
-    """Report for comparing multiple models based on annotation or ID overlap.
+class EntityComparisonReport(Report):
+    """Report for comparing multiple models based on annotation or ID overlap for a specific entity type.
     
     Dynamically generates Venn diagrams (for <= 4 models) or UpSet plots (for > 4 models)
-    to visualize the intersection of metabolites, reactions, and genes.
+    to visualize the intersection of entities.
     """
 
-    def __init__(self, models: list[cobra.Model], rename: list[str] = None, match_by: str = "annotation"):
+    def __init__(self, models: list[cobra.Model], entity_type: str, rename: list[str] = None, match_by: str = "all_annotations"):
         super().__init__()
         self.models = models
         
-        if match_by not in {"id", "annotation"}:
-            raise ValueError("match_by must be 'id' or 'annotation'.")
+        if entity_type not in ["reactions", "metabolites", "genes", "pathways"]:
+            raise ValueError(f"Invalid entity_type: {entity_type}. Must be 'reactions', 'metabolites', 'genes', or 'pathways'.")
+        self.entity_type = entity_type
+        
         self.match_by = match_by
         
         if len(self.models) < 2:
             raise ValueError("At least two models are required for comparison.")
             
-        self.model_names = rename if rename is not None else [m.id for m in models]
+        self.model_names = rename
         
         if len(self.models) != len(self.model_names):
             raise ValueError("Length of rename list must match number of models.")
@@ -2228,11 +2230,23 @@ class ModelComparisonReport(Report):
         if len(set(self.model_names)) != len(self.model_names):
             raise ValueError("Model names must be unique.")
             
-        self.overlap_data = {"reactions": {}, "metabolites": {}, "genes": {}}
+        self.overlap_data = {}
         self._calculate_overlap()
 
+    @property
+    def model_names(self):
+        return self._model_names
+
+    @model_names.setter
+    def model_names(self, rename_list):
+        if rename_list is not None:
+            self._model_names = rename_list
+        else:
+            # Fallback to model_i if internal ID is missing or empty
+            self._model_names = [m.id if getattr(m, 'id', None) else f"model_{i}" for i, m in enumerate(self.models)]
+
     def _get_flattened_annotations(self, entity) -> list:
-        """Extracts all relevant IDs or annotation strings for matching."""
+        """Extracts IDs or annotation CURIE strings, preserving database prefixes."""
         if self.match_by == "id":
             return [entity.id]
             
@@ -2240,90 +2254,91 @@ class ModelComparisonReport(Report):
         for db, ids in entity.annotation.items():
             if 'sbo' in db.lower():
                 continue
+                
+            # Filter by specific namespace if requested (e.g., match_by="bigg.metabolite")
+            if self.match_by != "all_annotations" and self.match_by not in db:
+                continue
+                
             if isinstance(ids, list):
                 for i in ids:
-                    annots.add(str(i))
+                    annots.add(f"{db}:{i}")
             elif isinstance(ids, str):
-                annots.add(str(ids))
+                annots.add(f"{db}:{ids}")
         return list(annots)
 
+    def _get_entities(self, model):
+        """Helper to extract entities, handling pathways via groups or reactions."""
+        if self.entity_type == "pathways":
+            if hasattr(model, "groups") and len(model.groups) > 0:
+                return model.groups
+            else:
+                return model.reactions
+        return getattr(model, self.entity_type, [])
+
     def _calculate_overlap(self):
-        """Calculates direct overlap by grouping entity nodes via Union-Find."""
+        """Calculates overlap by grouping entity nodes via Union-Find, preserving transitive closures."""
         from collections import defaultdict
         
-        for entity_type in ["reactions", "metabolites", "genes"]:
-            # 1. Collect all entities with a strict index mapping
-            all_entities = []
-            for model_name, model in zip(self.model_names, self.models):
-                for e in getattr(model, entity_type):
-                    all_entities.append((model_name, e))
-            
-            N = len(all_entities)
-            parent = list(range(N))
-            
-            def find(i):
-                if parent[i] == i: 
-                    return i
-                parent[i] = find(parent[i])
-                return parent[i]
-                
-            def union(i, j):
-                root_i = find(i)
-                root_j = find(j)
-                if root_i != root_j:
-                    parent[root_i] = root_j
-
-            # 2. Map annotations to entity indices
-            annot_to_indices = defaultdict(list)
-            unannotated_indices = []
-            
-            for i, (m_name, e) in enumerate(all_entities):
-                annots = self._get_flattened_annotations(e)
-                if not annots:
-                    unannotated_indices.append(i)
-                else:
-                    for ann in annots:
-                        annot_to_indices[ann].append(i)
-
-            # 3. Union all entities that share at least one annotation
-            for indices in annot_to_indices.values():
-                first_idx = indices[0]
-                for idx in indices[1:]:
-                    union(first_idx, idx)
-
-            # 4. Group models by the connected entity component root
-            components = defaultdict(set)
-            for i in range(N):
-                if i not in unannotated_indices:
-                    root = find(i)
-                    model_name = all_entities[i][0]
-                    components[root].add(model_name)
-
-            # 5. Extract unique model memberships to prevent double counting
-            memberships = [sorted(list(models)) for models in components.values()]
-            
-            # Keep unannotated entities strictly separated
-            for idx in unannotated_indices:
-                memberships.append([all_entities[idx][0]])
-                
-            self.overlap_data[entity_type] = memberships
-
-    def visualise(self, entity_type: Literal["reactions", "metabolites", "genes"] = "reactions", 
-                  cmap: Union[list[tuple], None] = None, upset_min_subset_size: int = 15, **kwargs) -> Union[matplotlib.figure.Figure, None]:
+        all_entities = []
+        for model_name, model in zip(self.model_names, self.models):
+            for e in self._get_entities(model):
+                all_entities.append((model_name, e))
         
-        if entity_type not in ["reactions", "metabolites", "genes"]:
-            raise ValueError(f"Invalid entity_type: {entity_type}. Must be 'reactions', 'metabolites', or 'genes'.")
+        N = len(all_entities)
+        parent = list(range(N))
+        
+        def find(i):
+            if parent[i] == i: 
+                return i
+            parent[i] = find(parent[i])
+            return parent[i]
             
-        memberships = self.overlap_data.get(entity_type, [])
-        if not memberships:
+        def union(i, j):
+            root_i = find(i)
+            root_j = find(j)
+            if root_i != root_j:
+                parent[root_i] = root_j
+
+        annot_to_indices = defaultdict(list)
+        unannotated_indices = []
+        
+        for i, (m_name, e) in enumerate(all_entities):
+            annots = self._get_flattened_annotations(e)
+            if not annots:
+                unannotated_indices.append(i)
+            else:
+                for ann in annots:
+                    annot_to_indices[ann].append(i)
+
+        for indices in annot_to_indices.values():
+            first_idx = indices[0]
+            for idx in indices[1:]:
+                union(first_idx, idx)
+
+        components = defaultdict(set)
+        for i in range(N):
+            if i not in unannotated_indices:
+                root = find(i)
+                model_name = all_entities[i][0]
+                components[root].add(model_name)
+
+        memberships = [sorted(list(models)) for models in components.values()]
+        
+        for idx in unannotated_indices:
+            memberships.append([all_entities[idx][0]])
+            
+        self.overlap_data = memberships
+
+    def visualise(self, cmap: Union[list[tuple], None] = None, upset_min_subset_size: int = 15, **kwargs) -> Union[matplotlib.figure.Figure, None]:
+        if not self.overlap_data:
             return None
             
         if len(self.models) <= 4:
-            return self._plot_venn(memberships, entity_type, cmap, **kwargs)
+            return self._plot_venn(self.overlap_data, cmap, **kwargs)
         else:
-            return self._plot_upset(memberships, entity_type, cmap, upset_min_subset_size, **kwargs)
+            return self._plot_upset(self.overlap_data, cmap, upset_min_subset_size, **kwargs)
 
-    def _plot_venn(self, memberships: list, entity_type: str, cmap, **kwargs):
+    def _plot_venn(self, memberships: list, cmap, **kwargs):
         model2ids = {name: set() for name in self.model_names}
         for i, models_present in enumerate(memberships):
             for model_name in models_present:
@@ -2332,10 +2347,10 @@ class ModelComparisonReport(Report):
         venn_kwargs = kwargs.get('venn_kwargs', {'fmt': "{percentage:.1f}%", 'legend_loc': 'lower right'})
         ax = venn(model2ids, cmap=cmap, **venn_kwargs)
         title_prefix = "ID" if self.match_by == "id" else "Annotation"
-        ax.set_title(f"{title_prefix} Overlap: {entity_type.capitalize()}")
+        ax.set_title(f"{title_prefix} Overlap: {self.entity_type.capitalize()}")
         return ax.get_figure()
 
-    def _plot_upset(self, memberships: list, entity_type: str, cmap, min_subset_size: int, **kwargs):
+    def _plot_upset(self, memberships: list, cmap, min_subset_size: int, **kwargs):
         from collections import Counter
         membership_tuples = [tuple(sorted(m)) for m in memberships]
         counts = Counter(membership_tuples)
@@ -2359,42 +2374,32 @@ class ModelComparisonReport(Report):
         plot_res["totals"].set_xlabel("Total Amount")
         
         title_prefix = "ID" if self.match_by == "id" else "Annotation"
-        fig.suptitle(f"{title_prefix} Overlap: {entity_type.capitalize()}", fontsize=14)
+        fig.suptitle(f"{title_prefix} Overlap: {self.entity_type.capitalize()}", fontsize=14)
         return fig
 
     def to_table(self) -> pd.DataFrame:
-        """Return a summary table of the overlap statistics."""
         import pandas as pd
         from collections import Counter
         
         rows = []
-        for entity_type, memberships in self.overlap_data.items():
-            counts = Counter([tuple(m) for m in memberships])
-            for models, count in counts.items():
-                rows.append({
-                    "Entity": entity_type,
-                    "Models_Shared": " & ".join(models),
-                    "Count": count
-                })
+        counts = Counter([tuple(m) for m in self.overlap_data])
+        for models, count in counts.items():
+            rows.append({
+                "Entity": self.entity_type,
+                "Models_Shared": ", ".join(models),
+                "Count": count
+            })
         return pd.DataFrame(rows)
 
     def save(self, dir: Union[str, Path], **kwargs):
-        """Save the comparison report tables and plots to the specified directory."""
         super().save(dir)
-        dir_path = Path(dir) / "ModelComparisonReport"
+        dir_path = Path(dir) / "EntityComparisonReport"
         dir_path.mkdir(parents=True, exist_ok=True)
         
         df = self.to_table()
-        df.to_csv(dir_path / "overlap_statistics.csv", index=False, sep=";")
+        df.to_csv(dir_path / f"{self.entity_type}_overlap_statistics.csv", index=False, sep=";")
         
-        for entity_type in ["reactions", "metabolites", "genes"]:
-            fig = self.visualise(entity_type=entity_type, **kwargs)
-            if fig:
-                fig.savefig(dir_path / f"{entity_type}_overlap.png", bbox_inches="tight", dpi=300)
-                plt.close(fig)
-                
-    def __str__(self):
-        return f"ModelComparisonReport comparing {len(self.models)} models: {', '.join(self.model_names)}."
-        
-    def to_dict(self) -> dict:
-        return self.overlap_data
+        fig = self.visualise(**kwargs)
+        if fig:
+            fig.savefig(dir_path / f"{self.entity_type}_overlap.png", bbox_inches="tight", dpi=300)
+            plt.close(fig)
