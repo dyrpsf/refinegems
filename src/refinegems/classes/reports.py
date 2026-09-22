@@ -2352,6 +2352,8 @@ class EntityComparisonReport(Report):
 
     def _plot_upset(self, memberships: list, cmap, min_subset_size: int, **kwargs):
         from collections import Counter
+        import numpy as np
+        
         membership_tuples = [tuple(sorted(m)) for m in memberships]
         counts = Counter(membership_tuples)
         
@@ -2361,7 +2363,16 @@ class EntityComparisonReport(Report):
         
         upset_data = from_memberships(list(counts.keys()), data=list(counts.values()))
         fig = plt.figure()
-        upset = UpSet(upset_data, subset_size='sum', min_subset_size=min_subset_size, show_counts=False)
+        
+        # @WARNING: UpSetPlot has a known bug with NumPy >= 2.4.0 where strictly typed scalar 
+        # casting causes Matplotlib to crash when drawing bar counts (TypeError: only 
+        # 0-dimensional arrays can be converted to Python scalars). 
+        # We disable show_counts for NumPy 2.4+ until upstream upsetplot is patched.
+        # See: https://github.com/jnothman/UpSetPlot/issues/301
+        np_major, np_minor = map(int, np.__version__.split('.')[:2])
+        safe_show_counts = (np_major < 2) or (np_major == 2 and np_minor < 4)
+        
+        upset = UpSet(upset_data, subset_size='sum', min_subset_size=min_subset_size, show_counts=safe_show_counts)
         
         if cmap and not upset_data.empty:
             max_degree = max(len(idx) for idx in upset_data.index)
