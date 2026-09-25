@@ -8,8 +8,10 @@ __author__ = "Carolin Brune, Famke Baeuerle, Gwendolyn O. Döbel"
 # requirements
 ################################################################################
 
+import bioregistry
 import cobra
 import copy
+import inspect
 import logging
 import math
 import matplotlib
@@ -24,6 +26,7 @@ import seaborn as sns
 import warnings
 
 from abc import ABC, abstractmethod
+from cobra import Model as cobraModel
 from importlib.resources import files
 from itertools import chain
 from libsbml import Model as libModel
@@ -2204,46 +2207,80 @@ class MultiSBOTermReport(Report):
 
 class EntityComparisonReport(Report):
     """Report for comparing multiple models based on annotation or ID overlap for a specific entity type.
-    
-    Dynamically generates Venn diagrams (for <= 4 models) or UpSet plots (for > 4 models)
-    to visualize the intersection of entities.
+
+    Attributes:
+        - models (list[cobraModel]):
+            Models loaded with COBRApy
+        - entity_type (Literal['genes', 'metabolites', 'reactions', 'pathways']):
+            Specifies the entity type to use for the comparison
+        - model_names (Union[None,list[str]], optional):
+            Takes a list of names for the provided models.
+            When not set, the model IDs are used.
+            In case a model has no ID, it gets the ID 'model_<number> assigned'.
+            Defaults to None.
+        - match_by (Union[Literal['id', 'annotation'], str], optional):
+            Specifies the match type for the comparison.
+            Needs to be one of 'annotation', 'id' or one of the keys in bioregistry.get_prefix_map().
+        - overlap_data (list[list]):
+            Calculated entity memberships accross the provided models.
     """
 
-    def __init__(self, models: list[cobra.Model], entity_type: str, rename: list[str] = None, match_by: str = "all_annotations"):
+    def __init__(self, models: list[cobraModel], entity_type: Literal['genes', 'metabolites', 'reactions', 'pathways'], model_names: Union[None,list[str]] = None, match_by: Union[Literal['id', 'annotation'], str] = "annotation"):
         super().__init__()
-        self.models = models
-        
-        if entity_type not in ["reactions", "metabolites", "genes", "pathways"]:
-            raise ValueError(f"Invalid entity_type: {entity_type}. Must be 'reactions', 'metabolites', 'genes', or 'pathways'.")
-        self.entity_type = entity_type
-        
-        self.match_by = match_by
-        
-        if len(self.models) < 2:
-            raise ValueError("At least two models are required for comparison.")
-            
-        self.model_names = rename
-        
-        if len(self.models) != len(self.model_names):
-            raise ValueError("Length of rename list must match number of models.")
-            
-        if len(set(self.model_names)) != len(self.model_names):
-            raise ValueError("Model names must be unique.")
-            
-        self.overlap_data = {}
-        self._calculate_overlap()
+        self._models = self._validate_models(models)
+        self._entity_type = self._validate_entity_type(entity_type)
+        self._match_by = self._validate_match_by(match_by)
+        self._model_names = self._set_validate_model_names(model_names)
+        self._overlap_data = self._calculate_overlap()
+
+    @property
+    def models(self):
+        return self._models
+
+    @property
+    def entity_type(self):
+        return self._entity_type
+
+    @property
+    def match_by(self):
+        return self._match_by
 
     @property
     def model_names(self):
         return self._model_names
 
-    @model_names.setter
-    def model_names(self, rename_list):
-        if rename_list is not None:
-            self._model_names = rename_list
-        else:
+    @property
+    def overlap_data(self):
+        return self._overlap_data
+
+    def _validate_models(self, models) -> list:
+        if len(models) < 2:
+            raise ValueError("At least two models are required for comparison.")
+        return models
+
+    def _validate_entity_type(self, entity_type) -> str:
+        if entity_type not in ['genes', 'metabolites', 'reactions', 'pathways']:
+            raise ValueError(f"Invalid entity_type: {entity_type}. Must be one of 'genes', 'metabolites', 'reactions', or 'pathways'.")
+        return entity_type
+
+    def _validate_match_by(self, match_by) -> str:
+        VALID_MATCH_BYS = ['annotation', 'id']
+        VALID_MATCH_BYS.extend(bioregistry.get_prefix_map().keys())
+        if match_by not in VALID_MATCH_BYS: raise ValueError(f'Invalid match_by: {match_by}. Must be one of "annotation", "id" or one of the keys in bioregistry.get_prefix_map().')
+        return match_by
+
+    def _set_validate_model_names(self, model_names) -> list[str]:
+        if model_names is None:
             # Fallback to model_i if internal ID is missing or empty
-            self._model_names = [m.id if getattr(m, 'id', None) else f"model_{i}" for i, m in enumerate(self.models)]
+            model_names = [m.id if getattr(m, 'id', None) else f"model_{i}" for i, m in enumerate(self.models)]
+        
+        if len(self.models) != len(model_names):
+            raise ValueError("Length of rename list must match number of models.")
+            
+        if len(set(model_names)) != len(model_names):
+            raise ValueError("Model names must be unique.")
+
+        return model_names
 
     def _get_flattened_annotations(self, entity) -> list:
         """Extracts IDs or annotation CURIE strings, preserving database prefixes."""
@@ -2256,7 +2293,7 @@ class EntityComparisonReport(Report):
                 continue
                 
             # Filter by specific namespace if requested (e.g., match_by="bigg.metabolite")
-            if self.match_by != "all_annotations" and self.match_by not in db:
+            if self.match_by != "annotation" and self.match_by not in db:
                 continue
                 
             if isinstance(ids, list):
@@ -2275,7 +2312,7 @@ class EntityComparisonReport(Report):
                 return model.reactions
         return getattr(model, self.entity_type, [])
 
-    def _calculate_overlap(self):
+    def _calculate_overlap(self) -> list[list]:
         """Calculates overlap by grouping entity nodes via Union-Find, preserving transitive closures."""
         from collections import defaultdict
         
@@ -2327,30 +2364,91 @@ class EntityComparisonReport(Report):
         for idx in unannotated_indices:
             memberships.append([all_entities[idx][0]])
             
-        self.overlap_data = memberships
+        return memberships
 
-    def visualise(self, cmap: Union[list[tuple], None] = None, upset_min_subset_size: int = 15, **kwargs) -> Union[matplotlib.figure.Figure, None]:
+    def visualise(self, cmap: Union[list[tuple], None] = None, no_title: bool=False, **kwargs) -> Union[matplotlib.figure.Figure, None]:
+        """Visualise the amount of entity overlap for a specified entity type over multiple models
+
+        Dynamically generates Venn diagrams (for <= 4 models) or UpSet plots (for > 4 models) to visualize the intersection of entities.
+
+        Args:
+            - cmap (Union[list[tuple],None], optional):
+                Color palette name or list of colours for the graphic.
+                If not set, uses default colours from pyvenn/upsetplot.
+                Defaults to None.
+            - no_title (bool, optional):
+                Optional parameter to specify if title should be set in figure or not.
+                Defaults to False.
+            - kwargs (dict, optional):
+                Dictionary containing details for plotting the EntityComparisonReport.
+                If no user input is specified for Venn diagrams the defaults are: {'fmt': "{percentage:.1f}%", 'legend_loc': 'lower right'}
+                and for UpSet plots the defaults are:  {'min_subset_size': 15, 'show_counts': True}
+
+        Raises:
+            - TypeError: Unkown type for color palette.
+
+        Returns:
+            matplotlib.figure.Figure:
+                The generated graphic
+        """
         if not self.overlap_data:
             return None
             
         if len(self.models) <= 4:
-            return self._plot_venn(self.overlap_data, cmap, **kwargs)
+            figure = self._plot_venn(self.overlap_data, cmap, **kwargs)
         else:
-            return self._plot_upset(self.overlap_data, cmap, upset_min_subset_size, **kwargs)
+            figure = self._plot_upset(self.overlap_data, cmap, **kwargs)
 
-    def _plot_venn(self, memberships: list, cmap, **kwargs):
+        if not no_title:
+            title_prefix = "Model ID" if self.match_by == "id" else self.match_by.capitalize()
+            figure.suptitle(f"{title_prefix} Overlap: {self.entity_type.capitalize()}", fontsize=14)
+        return figure
+
+    def _supported_kwargs(self, plot_function, kwargs, excluded=()) -> dict:
+        parameters = inspect.signature(plot_function).parameters
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+        if accepts_kwargs:
+            return dict(kwargs)
+
+        supported = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        supported -= set(excluded)
+
+        ignored = set(kwargs) - supported
+        if ignored:
+            warnings.warn(
+                f"Ignoring unsupported plotting options: {sorted(ignored)}",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        return {key: value for key, value in kwargs.items() if key in supported}
+
+    def _plot_venn(self, memberships: list, cmap, **kwargs) -> matplotlib.figure.Figure:
         model2ids = {name: set() for name in self.model_names}
         for i, models_present in enumerate(memberships):
             for model_name in models_present:
                 model2ids[model_name].add(f"entity_{i}")
-                
-        venn_kwargs = kwargs.get('venn_kwargs', {'fmt': "{percentage:.1f}%", 'legend_loc': 'lower right'})
+
+        venn_kwargs = self._supported_kwargs(venn, kwargs, excluded={"data", "cmap"})
+        
+        # Setting defaults if according keys were not provided
+        if 'fmt' not in venn_kwargs.keys(): venn_kwargs['fmt'] = "{percentage:.1f}%"
+        if 'legend_loc' not in venn_kwargs.keys(): venn_kwargs['legend_loc'] = 'lower right'
         ax = venn(model2ids, cmap=cmap, **venn_kwargs)
-        title_prefix = "ID" if self.match_by == "id" else "Annotation"
-        ax.set_title(f"{title_prefix} Overlap: {self.entity_type.capitalize()}")
         return ax.get_figure()
 
-    def _plot_upset(self, memberships: list, cmap, min_subset_size: int, **kwargs):
+    def _plot_upset(self, memberships: list, cmap, **kwargs) -> matplotlib.figure.Figure:
         from collections import Counter
         import numpy as np
         
@@ -2363,7 +2461,9 @@ class EntityComparisonReport(Report):
         
         upset_data = from_memberships(list(counts.keys()), data=list(counts.values()))
         fig = plt.figure()
-        
+
+        upset_kwargs = self._supported_kwargs(UpSet, kwargs)
+        # Setting defaults if according keys were not provided
         # @WARNING: UpSetPlot has a known bug with NumPy >= 2.4.0 where strictly typed scalar 
         # casting causes Matplotlib to crash when drawing bar counts (TypeError: only 
         # 0-dimensional arrays can be converted to Python scalars). 
@@ -2371,8 +2471,23 @@ class EntityComparisonReport(Report):
         # See: https://github.com/jnothman/UpSetPlot/issues/301
         np_major, np_minor = map(int, np.__version__.split('.')[:2])
         safe_show_counts = (np_major < 2) or (np_major == 2 and np_minor < 4)
+        if not safe_show_counts: 
+            logger.warning(f'''
+                            Installed numpy version: {np.__version__}
+                            Skipping show_counts as upsetplot from numpy version 2.4 onwards throws error. 
+                            See: https://github.com/jnothman/UpSetPlot/issues/301
+                            ''')
+        show_counts = upset_kwargs.pop('show_counts', safe_show_counts) and safe_show_counts
+        upset_kwargs['show_counts'] = show_counts
+        if 'min_subset_size' not in upset_kwargs.keys(): upset_kwargs['min_subset_size'] = 15
+
+        # Setting subset_size on specific value as depends on data
+        requested_subset_size = upset_kwargs.pop('subset_size', 'sum')
+        if requested_subset_size != 'sum': 
+            logger.warning(f'Ignoring user input "subset_size": {requested_subset_size} as "subset_size": "sum" required for this report.')
+        upset_kwargs["subset_size"] = requested_subset_size
         
-        upset = UpSet(upset_data, subset_size='sum', min_subset_size=min_subset_size, show_counts=safe_show_counts)
+        upset = UpSet(upset_data, **upset_kwargs)
         
         if cmap and not upset_data.empty:
             max_degree = max(len(idx) for idx in upset_data.index)
@@ -2382,10 +2497,7 @@ class EntityComparisonReport(Report):
 
         plot_res = upset.plot(fig=fig)
         plot_res["intersections"].set_ylabel("Subset size")
-        plot_res["totals"].set_xlabel("Total Amount")
-        
-        title_prefix = "ID" if self.match_by == "id" else "Annotation"
-        fig.suptitle(f"{title_prefix} Overlap: {self.entity_type.capitalize()}", fontsize=14)
+        plot_res["totals"].set_xlabel("Total amount")
         return fig
 
     def to_table(self) -> pd.DataFrame:
@@ -2403,12 +2515,18 @@ class EntityComparisonReport(Report):
         return pd.DataFrame(rows)
 
     def save(self, dir: Union[str, Path], **kwargs):
+        """Saves the report as TSV file as well as the according figure
+
+        Args:
+            - dir (Union[str, Path]): 
+                Path to ouput directory
+        """
         super().save(dir)
-        dir_path = Path(dir) / "EntityComparisonReport"
+        dir_path = Path(dir, "EntityComparisonReport")
         dir_path.mkdir(parents=True, exist_ok=True)
         
         df = self.to_table()
-        df.to_csv(dir_path / f"{self.entity_type}_overlap_statistics.csv", index=False, sep=";")
+        df.to_csv(dir_path / f"{self.entity_type}_overlap_statistics.tsv", index=False, sep="\t")
         
         fig = self.visualise(**kwargs)
         if fig:

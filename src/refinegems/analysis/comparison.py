@@ -222,7 +222,7 @@ def plot_venn(
     entity_map = {"metabolite": "metabolites", "reaction": "reactions"}
     mapped_entity = entity_map.get(entity, entity)
     
-    report = EntityComparisonReport(models, entity_type=mapped_entity, rename=rename_list, match_by="id")
+    report = EntityComparisonReport(models, entity_type=mapped_entity, model_names=rename_list, match_by="id")
     
     venn_kwargs = {'fmt': "{percentage:.1f}%"} if perc else {}
     fig = report.visualise(venn_kwargs=venn_kwargs)
